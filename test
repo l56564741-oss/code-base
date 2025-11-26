@@ -1,0 +1,229 @@
+package com.tcs.sinch.config;
+
+import io.netty.channel.ChannelOption;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.resources.ConnectionProvider;
+
+import java.time.Duration;
+
+/**
+ * Static WebClient configuration for Azure Functions
+ * Optimized for Azure SNAT port constraints (128 ports per instance)
+ */
+public class WebClientConfig {
+
+    private static final Logger LOG = LoggerFactory.getLogger(WebClientConfig.class);
+
+    // Static initialization - created once per Azure Function instance
+    private static final ConnectionProvider CONNECTION_PROVIDER;
+    private static final HttpClient HTTP_CLIENT;
+    private static final WebClient WEB_CLIENT;
+    
+    // Pool name for metrics lookup
+    private static final String POOL_NAME = "sinch-sms-pool";
+
+    static {
+        LOG.info("Initializing static WebClient configuration for Azure Function");
+
+        // Step 1: Configure Connection Provider with metrics enabled
+        CONNECTION_PROVIDER = ConnectionProvider.builder(POOL_NAME)
+            .maxConnections(10)                              // Limit to 10 connections per instance
+            .maxIdleTime(Duration.ofSeconds(20))             // Close idle connections after 20s
+            .maxLifeTime(Duration.ofSeconds(60))             // Force connection rotation after 60s
+            .pendingAcquireMaxCount(50)                      // Queue up to 50 requests when pool full
+            .evictInBackground(Duration.ofSeconds(30))       // Background cleanup every 30s
+            .metrics(true)                                   // Enable connection pool metrics
+            .build();
+
+        LOG.info("ConnectionProvider initialized: maxConnections=10, maxIdleTime=20s, maxLifeTime=60s, metrics=enabled");
+
+        // Step 2: Configure HTTP Client
+        HTTP_CLIENT = HttpClient.create(CONNECTION_PROVIDER)
+            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)  // 5s TCP connection timeout
+            .option(ChannelOption.SO_KEEPALIVE, true)            // Enable TCP keep-alive
+            .responseTimeout(Duration.ofSeconds(30));            // 30s response timeout
+
+        LOG.info("HttpClient initialized: connectTimeout=5000ms, responseTimeout=30s");
+
+        // Step 3: Build WebClient
+        WEB_CLIENT = WebClient.builder()
+            .clientConnector(new ReactorClientHttpConnector(HTTP_CLIENT))
+            .defaultHeader(HttpHeaders.CONNECTION, "keep-alive") // HTTP keep-alive header
+            .build();
+
+        LOG.info("WebClient initialized successfully");
+    }
+
+    /**
+     * Returns the singleton WebClient instance
+     * Thread-safe and optimized for Azure Functions
+     */
+    public static WebClient getWebClient() {
+        return WEB_CLIENT;
+    }
+
+    /**
+     * Returns the ConnectionProvider instance for direct access
+     */
+    public static ConnectionProvider getConnectionProvider() {
+        return CONNECTION_PROVIDER;
+    }
+
+    /**
+     * Returns connection pool metrics for monitoring
+     * Returns null if metrics are not available
+     */
+    public static ConnectionProvider.ConnectionPoolMetrics getConnectionPoolMetrics() {
+        try {
+            // Get metrics from the connection provider
+            return CONNECTION_PROVIDER.metrics().get(POOL_NAME);
+        } catch (Exception e) {
+            LOG.warn("Failed to retrieve connection pool metrics: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Logs current connection pool statistics
+     */
+    public static void logPoolStatistics() {
+        ConnectionProvider.ConnectionPoolMetrics metrics = getConnectionPoolMetrics();
+        if (metrics != null) {
+            LOG.info("[Connection Pool Statistics] " +
+                    "Pool: {}, " +
+                    "Active: {}, " +
+                    "Idle: {}, " +
+                    "Pending: {}, " +
+                    "Max: {}, " +
+                    "Available: {}",
+                POOL_NAME,
+                metrics.acquiredSize(),
+                metrics.idleSize(),
+                metrics.pendingAcquireSize(),
+                metrics.maxAllocatedSize(),
+                metrics.maxAllocatedSize() - metrics.acquiredSize()
+            );
+        }
+    }
+
+    /**
+     * Prevents instantiation
+     */
+    private WebClientConfig() {
+        throw new UnsupportedOperationException("Utility class cannot be instantiated");
+    }
+}
+package com.tcs.sinch;
+
+import com.tcs.sinch.config.WebClientConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.MediaType;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.util.retry.Retry;
+
+import java.time.Duration;
+
+public class SinchSmsService {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SinchSmsService.class);
+    
+    // Get WebClient from configuration class
+    private static final WebClient webClient = WebClientConfig.getWebClient();
+
+    private final String apimURL;
+    private final String xapiKey;
+
+    /**
+     * Constructor with API configuration
+     */
+    public SinchSmsService(String apimURL, String xapiKey) {
+        this.apimURL = apimURL;
+        this.xapiKey = xapiKey;
+        LOG.info("SinchSmsService initialized for URL: {}", apimURL);
+    }
+
+    /**
+     * Sends SMS via Sinch API with retry logic and proper connection pooling
+     * 
+     * @param smsRequest The SMS request model
+     * @return SinchApiResponse or empty response on error
+     */
+    public SinchApiResponse sendSms(SinchModel smsRequest) {
+        LOG.info("Calling Sinch SMS API for recipient: {}", smsRequest.getRecipient());
+
+        // Log connection pool metrics before request
+        logConnectionPoolMetrics("BEFORE request");
+
+        try {
+            LOG.debug("WebClient instance hashCode: {}", webClient.hashCode());
+
+            SinchApiResponse response = webClient.post()
+                .uri(apimURL)
+                .header("X-API-KEY", xapiKey)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(smsRequest)
+                .accept(MediaType.APPLICATION_JSON)
+                .retrieve()
+                .bodyToMono(SinchApiResponse.class)
+                .retryWhen(Retry.fixedDelay(3, Duration.ofSeconds(1))
+                    .doBeforeRetry(retrySignal -> {
+                        LOG.warn("Retrying SMS API call, attempt: {}", retrySignal.totalRetries() + 1);
+                        logConnectionPoolMetrics("DURING retry");
+                    })
+                )
+                .timeout(Duration.ofSeconds(30))
+                .block();
+
+            LOG.info("SMS API call successful");
+            
+            // Log connection pool metrics after request
+            logConnectionPoolMetrics("AFTER successful request");
+            
+            return response != null ? response : new SinchApiResponse();
+
+        } catch (Exception e) {
+            LOG.error("Exception occurred while calling Sinch SMS API: {}", e.getMessage(), e);
+            
+            // Log connection pool metrics after error
+            logConnectionPoolMetrics("AFTER error");
+            
+            return new SinchApiResponse();
+        }
+    }
+
+    /**
+     * Logs connection pool metrics including active, idle, and pending connections
+     */
+    private void logConnectionPoolMetrics(String context) {
+        try {
+            reactor.netty.resources.ConnectionProvider.ConnectionPoolMetrics metrics = 
+                WebClientConfig.getConnectionPoolMetrics();
+            
+            if (metrics != null) {
+                LOG.info("[Connection Pool Metrics - {}] " +
+                        "Active: {}, " +
+                        "Idle: {}, " +
+                        "Pending: {}, " +
+                        "MaxConnections: {}, " +
+                        "Available: {}",
+                    context,
+                    metrics.acquiredSize(),           // Currently in-use connections
+                    metrics.idleSize(),               // Idle connections in pool
+                    metrics.pendingAcquireSize(),     // Requests waiting for connection
+                    metrics.maxAllocatedSize(),       // Max configured connections
+                    metrics.maxAllocatedSize() - metrics.acquiredSize() // Available connections
+                );
+            } else {
+                LOG.warn("[Connection Pool Metrics - {}] Metrics not available", context);
+            }
+        } catch (Exception e) {
+            LOG.warn("Failed to retrieve connection pool metrics: {}", e.getMessage());
+        }
+    }
+}
